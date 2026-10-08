@@ -111,3 +111,86 @@ widać od razu. Do tego PIT: każda zmiana typu `<=` na `<` w kodzie domeny wywr
 **Co z wielowątkowością?**
 Arkusz jest celowo jednowątkowy. Etap 3: jeden wątek na instrument i kolejka poleceń
 przed nim — ten sam model, którego używa LMAX. Zero blokad, deterministyczna kolejność.
+
+---
+
+## Etap 3 — silnik: wątek na instrument
+
+### Problem
+
+Arkusz z etapu 2 nie jest bezpieczny wątkowo. Serwer HTTP obsługuje wiele żądań naraz,
+każde na innym wątku. Gdyby dwa wątki jednocześnie zmieniały `TreeMap`, drzewo może się
+uszkodzić — i to nie teoretycznie: w ramach testu celowo wyłączyłem kolejkę, a zepsuty
+silnik **zawiesił się w nieskończonej pętli** wewnątrz `TreeMap`.
+
+### Rozwiązanie: jeden pisarz
+
+```
+wiele wątków ──► ArrayBlockingQueue ──► jeden wątek engine-CDR ──► OrderBook
+```
+
+To jak **event loop w Node.js**: wiele źródeł zdarzeń, jeden wątek, który je obsługuje
+po kolei. Różnica: tu każda spółka ma *własną* pętlę, więc CDR i PKO idą równolegle
+na różnych rdzeniach.
+
+- **Zamiast blokady przy każdym zleceniu** — wątek, który jako jedyny dotyka arkusza.
+  Blokady (`synchronized`) też by zadziałały, ale przy dużym ruchu wątki czekałyby na
+  siebie, a kolejność obsługi zależałaby od planisty systemu.
+- **`CompletableFuture`** to `Promise` z JS. Wołający dostaje go od razu, a silnik
+  rozwiązuje go, gdy dojdzie do polecenia. `join()` ≈ `await`.
+- **Ograniczona kolejka** (`ArrayBlockingQueue` o stałej pojemności). Gdy jest pełna,
+  `offer()` zwraca `false` i odpowiadamy błędem od razu. To jest **backpressure**:
+  lepiej odrzucić żądanie, niż zbierać je w pamięci, aż serwer padnie.
+
+### Haczyki, które wyszły w review i testach
+
+| Problem | Co by się stało | Poprawka |
+|---|---|---|
+| Wyjątek typu `Error` (np. `AssertionError` z odbiorcy zdarzeń) | wątek silnika umiera po cichu, wszystkie `join()` wiszą na zawsze | łapiemy `Throwable` w zadaniu i przy publikacji |
+| `close()` wywołane z wątku silnika | `thread.join()` czeka na samego siebie — zakleszczenie | wyraźny `IllegalStateException` |
+| Drugie równoległe `close()` | wracało od razu, choć silnik jeszcze pracował | każde wywołanie czeka na koniec wątku |
+| Przerwanie (`interrupt`) wątku wołającego `close()` | STOP nie trafiał do kolejki, wątek silnika żył wiecznie | ponawiamy `put`, flagę przerwania przywracamy na koniec |
+| Zegar rzucał wyjątek po zmianie arkusza | zlecenie w arkuszu, a klient dostaje błąd | czas odczytywany przed zmianą arkusza |
+| Test współbieżności bez limitu czasu | zepsuty silnik zawiesiłby CI na godziny | `@Timeout(30)` — sprawdzone sabotażem |
+
+### Jak testujemy współbieżność
+
+Testy wielowątkowe są trudne, bo wynik zależy od przeplotu wątków. Sztuczka:
+
+1. 8 wątków naraz wysyła po 2000 losowych zleceń i anulowań.
+2. Silnik zapisuje dziennik: każde polecenie to jedna paczka zdarzeń z numerami kolejnymi.
+3. Po wszystkim **odtwarzamy dziennik na świeżym arkuszu, w jednym wątku**.
+4. Wynik musi być identyczny co do zdarzenia.
+
+Jeśli silnik kiedykolwiek przeplótłby dwa polecenia, odtworzenie się rozjedzie. A to,
+że z dziennika da się odtworzyć stan — to dokładnie **event sourcing**, który dojdzie w etapie 8.
+
+Do tego testy cyklu życia **deterministycznie** zapychają kolejkę: odbiorca zdarzeń
+zatrzymuje wątek silnika na `CountDownLatch`, dopóki test go nie zwolni. Bez `sleep()`
+i bez liczenia na szczęście.
+
+### Pytania z rozmowy
+
+**Dlaczego nie `synchronized` na metodach arkusza?**
+Zadziałałoby, ale: wątki czekałyby na siebie przy każdym zleceniu, kolejność zależałaby
+od planisty systemu, a każda nowa metoda musiałaby pamiętać o blokadzie. Jeden wątek
+na instrument daje jednoznaczną kolejność i zero blokad w samym kojarzeniu.
+
+**Czy to w ogóle jest „bez blokad”?**
+Kojarzenie — tak. Przekazanie polecenia do kolejki ma synchronizację
+(`ArrayBlockingQueue` używa zamka w środku, a my krótkiego `synchronized` przy sprawdzeniu
+„czy silnik przyjmuje”). LMAX Disruptor idzie krok dalej: bufor pierścieniowy
+z operacjami atomowymi zamiast zamka. Uczciwa odpowiedź: *wąskie gardło nie ma blokad,
+przekazanie ma — i przy tej skali to nie jest problem*.
+
+**Co jeśli jedna spółka dostaje 100× więcej zleceń niż reszta?**
+Jej wątek jest wąskim gardłem, a reszta działa normalnie — instrumenty są niezależne.
+Pełna kolejka tej spółki zaczyna odrzucać zlecenia (backpressure), zamiast zabić cały serwer.
+
+**Dlaczego id nadaje silnik, a nie np. `AtomicLong` w kontrolerze?**
+Wątek A dostaje id 5, wątek B id 6, ale B pierwszy wstawia do kolejki. Arkusz zobaczy 6
+przed 5 i odrzuci 5, bo id muszą rosnąć. Numeracja musi powstawać tam, gdzie powstaje kolejność.
+
+**Co się dzieje z poleceniami w kolejce przy zamykaniu aplikacji?**
+`close()` przestaje przyjmować nowe, wstawia znacznik STOP *za* czekającymi i czeka,
+aż wątek je wszystkie wykona. Żadne przyjęte polecenie nie zostaje bez odpowiedzi.
