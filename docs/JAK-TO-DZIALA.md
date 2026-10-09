@@ -333,3 +333,75 @@ a awaria bazy zatrzymuje handel. Rozwiązanie: transactional outbox i asynchroni
 **Testcontainers vs H2 vs mocki?**
 Mock sprawdza, że wołasz `jdbc.update`, a nie że SQL działa. H2 udaje Postgresa, ale nie do końca.
 Testcontainers to prawdziwa baza w tej samej wersji co produkcja — kosztem kilku sekund i Dockera.
+
+## Etap 5a — zapis poza wątkiem silnika
+
+### Problem
+
+Po etapie 4b silnik czekał na bazę przy każdym poleceniu: ~1 ms zapisu = najwyżej ~1000
+poleceń/s na spółkę, a gdy baza leżała, każde polecenie stało 2 s na połączenie.
+
+### Rozwiązanie
+
+```
+engine-CDR ─┐                        ┌──────────────────────────┐
+engine-PKO ─┼─► [ kolejka paczek ] ──┤ event-writer: weź 1 + do  ├─► JdbcEventSink ─► 1 transakcja
+engine-PZU ─┘    (10 000, FIFO)      │ 255 czekających naraz     │    (group commit)
+                                     └──────────────────────────┘
+```
+
+- **`AsyncEventSink`** (pakiet `engine`, czysta Java) owija dowolnego odbiorcę. Silnik oddaje
+  paczkę do kolejki i wraca do kojarzenia.
+- **Group commit** — gdy baza jest wolna, w kolejce zbiera się wiele paczek i idą jedną transakcją.
+  Im większy ruch, tym taniej na polecenie. Ten sam trik stosują bazy danych przy zapisie logu.
+- **Ponawianie do skutku z rosnącą przerwą** (100 ms, 200 ms… do 3,2 s). Zdarzenia nie giną.
+- **Backpressure** — pełna kolejka zatrzymuje silnik. Giełda bez dziennika handlowałaby „na gębę”.
+
+Dla znających JS: to jak kolejka w Node z jednym workerem, który robi `INSERT` paczkami,
+a producent czeka (`await`), gdy kolejka jest pełna.
+
+### Haczyki, które wyszły w review i testach
+
+| Problem | Co by się stało | Poprawka |
+|---|---|---|
+| `ObjectProvider` w `EngineConfig` | Spring nie wiedział, że silnik zależy od odbiorcy — mógł zamknąć zapis przed silnikiem i zgubić ostatnie zdarzenia | `Optional<EventSink>` + test na kolejność zależności (pierwsza wersja go nie przeszła) |
+| Martwa baza + pełna kolejka przy wyłączaniu | silnik wisi w `publish`, zapis ponawia w nieskończoność — aplikacja nie daje się zamknąć | zegar zamykania od `ContextClosedEvent`; po terminie nikt na nic nie czeka |
+| Commit się udał, ale potwierdzenie zginęło | ponowienie wpada w klucz główny i dziennik stoi na zawsze | `on conflict do nothing` — zapis idempotentny |
+| Sprawdzenie „czy zamknięty” i wstawienie bez wspólnego zamka | paczka wstawiona w trakcie zamykania znikała bez śladu | sprawdzenie i wstawienie pod jednym zamkiem, bez znacznika STOP |
+| Każdy błąd logowany z pełnym stosem | godzinna awaria = ponad tysiąc stack trace'ów | pełny stos tylko przy pierwszej próbie |
+
+Świadomie zostawione:
+- **Klient dostaje odpowiedź, zanim zdarzenie jest w bazie.** Okno ryzyka to milisekundy;
+  prawdziwe giełdy potwierdzają dopiero po zapisie/replikacji dziennika (LMAX: replikacja przed
+  przetworzeniem). U nas za drogie na ten etap.
+- **Jedna zła paczka zatrzymuje dziennik wszystkich spółek** (group commit miesza spółki).
+  Zatrzymanie jest celowe — dziura w dzienniku byłaby gorsza — ale izolacji między spółkami nie ma.
+- **Polecenia, które czekały w kolejce podczas awarii, wykonają się po niej**, choć klient dostał
+  już 504. Rozwiązanie: termin ważności polecenia (TTL) — do rozważenia przy botach.
+
+### Jak testujemy wątek, którego nie widać
+
+- Zatrzymanie odbiorcy na `CountDownLatch` → wiadomo dokładnie, co czeka w kolejce, więc da się
+  sprawdzić, że 3 paczki poszły **jednym** wywołaniem, a 301 paczek jako 1 + 256 + 44.
+- Odbiorca, który rzuca N razy → zapis dochodzi dokładnie raz, w tej samej kolejności.
+- Liczenie prób w 300 ms → z przerwami jest ich kilka, bez przerw byłyby tysiące.
+- Każdy test ma `@Timeout(10)`, a całość odpalona 8× pod rząd bez migania.
+
+### Pytania z rozmowy
+
+**Czemu nie `@Async` ze Springa albo `ExecutorService`?**
+Executor ma nieograniczoną kolejkę (domyślnie) i wiele wątków — tracimy kolejność i backpressure.
+Tu potrzebne są dokładnie: FIFO, jeden pisarz, ograniczona kolejka i sklejanie paczek.
+
+**Co to jest group commit i czemu przyspiesza?**
+Koszt transakcji to głównie `fsync` przy commicie, a nie liczba wierszy. 200 poleceń w jednej
+transakcji to jeden `fsync` zamiast 200. Pod obciążeniem kolejka sama rośnie, więc paczki też.
+
+**Dlaczego ponawiać w nieskończoność, a nie np. 3 razy?**
+Po 3 próbach musielibyśmy zdarzenia wyrzucić, a wtedy dziennik ma dziurę i z arkusza nie da
+się go odtworzyć. Uczciwiej zatrzymać handel (backpressure) i ponawiać, aż baza wróci.
+
+**Po co idempotencja, skoro mamy transakcję?**
+Transakcja chroni przed „pół zapisu”, ale nie przed „zapisałem, ale nie wiem o tym”. Gdy
+odpowiedź na `COMMIT` zginie w sieci, jedyne bezpieczne wyjście to ponowić — a to wymaga,
+żeby drugi zapis tego samego nic nie zmienił.
