@@ -194,3 +194,73 @@ przed 5 i odrzuci 5, bo id muszą rosnąć. Numeracja musi powstawać tam, gdzie
 **Co się dzieje z poleceniami w kolejce przy zamykaniu aplikacji?**
 `close()` przestaje przyjmować nowe, wstawia znacznik STOP *za* czekającymi i czeka,
 aż wątek je wszystkie wykona. Żadne przyjęte polecenie nie zostaje bez odpowiedzi.
+
+## Etap 4a — REST API
+
+### Co powstało
+
+```
+HTTP ──► OrderController ──► MatchingEngine.instrument("CDR").place(...) ──► CompletableFuture
+           │  JSON ↔ rekordy                                                      │
+           │  złotówki ↔ grosze (Prices)                         EngineCalls.await(future, 5s)
+           └─ błędy → ApiExceptionHandler → ProblemDetail (RFC 9457)
+```
+
+- **`api/`** — kontroler, rekordy żądań i odpowiedzi, obsługa błędów. Zero logiki giełdowej.
+- **`config/`** — `ExchangeProperties` (spółki, kolejka, limit czasu z `application.yml`)
+  i `EngineConfig`, który składa silnik. Silnik dalej nie wie, że Spring istnieje.
+
+Dla znających JS/TS: `@RestController` + `@PostMapping` to router z Expressa, rekord
+`PlaceOrderRequest` z `@NotNull`/`@Positive` to schemat Zod, a `@RestControllerAdvice`
+to middleware błędów `(err, req, res, next)`.
+
+### Najważniejsze decyzje
+
+| Decyzja | Dlaczego |
+|---|---|
+| Ceny w API jako `BigDecimal`, w JSON-ie jako tekst `"101.25"` | `double` nie umie zapisać 101.25 dokładnie; JS sparsowałby liczbę do `double` |
+| Ułamek grosza → 400, a nie zaokrąglenie | giełda nie zgaduje, ile klient miał na myśli |
+| Jackson w trybie ścisłym | domyślnie `"quantity": 10.9` → 10, a `"side": 1` → SELL (indeks enuma) |
+| Walidacja **przed** kolejką silnika | złe zlecenie nie zajmuje miejsca poprawnym i nie zużywa id |
+| 503 vs 504 | 503: pełna kolejka, zlecenie na pewno nie weszło. 504: czekało za długo, **może się jeszcze wykonać** |
+| Wątki wirtualne (`spring.threads.virtual.enabled`) | wątek żądania czeka na silnik; wirtualny czeka prawie za darmo |
+| Własny `InvalidOrderException` zamiast łapania `IllegalArgumentException` | IAE rzucone głęboko w domenie to błąd serwera — nie może wyjść jako 400 „twoja wina” |
+
+### Co znalazł code review (i co poprawiono)
+
+| Problem | Poprawka |
+|---|---|
+| `"quantity": 10.9` po cichu kupowało 10 akcji | `accept-float-as-int: false` + test (sprawdzony sabotażem) |
+| `"side": 1` dawało SELL | `fail-on-numbers-for-enums: true` |
+| każdy `IllegalArgumentException` → 400 | osobny wyjątek dla błędów klienta |
+| `request-timeout: 0s` przechodził walidację, potem każde zlecenie → 504 | `@DurationMin(millis = 1)` + test startu |
+| zła treść + nieznana spółka dawało 400 | najpierw zasób (404), potem treść (400) |
+| 300 ms limitu w testach mogło migać na wolnym CI | 2 s |
+
+Świadomie zostawione:
+- **Odczyt arkusza idzie przez kolejkę silnika.** Daje obraz spójny co do zlecenia, ale
+  zajmuje miejsce w kolejce. Przy dużym ruchu odczyty przejmie WebSocket z publikowanym
+  obrazem (etap 6).
+- **Po 504 klient nie wie, czy zlecenie weszło.** Prawdziwe rozwiązanie to id nadawane
+  przez klienta (`clientOrderId`) i idempotencja — wróci przy broker-ledger.
+
+### Pytania z rozmowy
+
+**Dlaczego nie `double` na ceny, skoro to tylko API?**
+`0.1 + 0.2 = 0.30000000000000004`. `BigDecimal` trzyma liczbę dziesiętnie, więc „101.25”
+to dokładnie 101.25. W środku i tak liczymy na groszach w `long` — szybciej niż `BigDecimal`.
+
+**Czym się różni 503 od 504 i czemu to ważne?**
+Przy 503 wiemy, że zlecenie nie weszło — klient może ponowić. Przy 504 polecenie siedzi
+w kolejce i może się wykonać za sekundę. Ponowienie w ciemno = podwójne zlecenie.
+To przykład, że kod błędu to kontrakt, a nie ozdoba.
+
+**Jak testujesz 504 i 503 bez `sleep()`?**
+Odbiorca zdarzeń w teście zatrzymuje wątek silnika na `CountDownLatch`. Pierwsze zlecenie
+czeka na niego (504), drugie zajmuje jedyne miejsce w kolejce o pojemności 1 (504),
+trzecie nie ma gdzie wejść (503). Na koniec testu zatrzask się otwiera.
+
+**`@WebMvcTest` czy `@SpringBootTest`?**
+`@WebMvcTest` stawia tylko warstwę web — kontrolery, Jackson, walidację — bez serwera i bazy.
+Silnik podajemy prawdziwy, bo jest szybki i czysty; mock sprawdzałby tylko, czy kontroler
+woła metodę, a nie czy JSON zgadza się z tym, co naprawdę dzieje się w arkuszu.
