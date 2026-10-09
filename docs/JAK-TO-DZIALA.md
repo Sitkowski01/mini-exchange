@@ -264,3 +264,72 @@ trzecie nie ma gdzie wejść (503). Na koniec testu zatrzask się otwiera.
 `@WebMvcTest` stawia tylko warstwę web — kontrolery, Jackson, walidację — bez serwera i bazy.
 Silnik podajemy prawdziwy, bo jest szybki i czysty; mock sprawdzałby tylko, czy kontroler
 woła metodę, a nie czy JSON zgadza się z tym, co naprawdę dzieje się w arkuszu.
+
+## Etap 4b — dziennik zdarzeń w PostgreSQL
+
+### Co powstało
+
+```
+silnik ──EventSink.publish(paczka)──► JdbcEventSink ──jedna transakcja──► engine_event
+   ▲                                     (persistence/)
+   └── EngineConfig dostaje EventSink przez ObjectProvider i nie wie, że to baza
+```
+
+- **`V1__engine_events.sql`** — Flyway odpala migracje przy starcie, w kolejności numerów
+  i każdą tylko raz (pamięta je w `flyway_schema_history`). Schemat bazy jest w gicie, jak kod.
+- **`JdbcEventSink`** — zamienia zdarzenie na wiersz (sealed `switch`) i zapisuje paczkę
+  przez `batchUpdate` w jednej transakcji.
+- **`compose.yaml`** + `spring-boot-docker-compose` — `./gradlew bootRun` sam podnosi Postgresa.
+- **Testcontainers** — testy stawiają prawdziwego Postgresa w Dockerze; `@ServiceConnection`
+  wstrzykuje jego adres do Springa.
+
+Dla znających Node: Flyway ≈ migracje Prismy/Knexa, `JdbcTemplate` ≈ `pg` z ręcznym SQL-em
+(bez ORM-a — przy append-only logu ORM nic nie daje), Testcontainers ≈ `docker run` w `beforeAll`.
+
+### Najważniejsze decyzje
+
+| Decyzja | Dlaczego |
+|---|---|
+| Kolumny zamiast JSON-a | zwykły SQL po transakcjach, a `CHECK` pilnuje kształtu każdego typu |
+| `run_id` | po restarcie silnik numeruje od 1 — bez przebiegu klucz `(symbol, sequence)` by się zderzył |
+| Testy na prawdziwym Postgresie, nie na H2 | H2 przepuściłby SQL, którego Postgres nie zna, i nie sprawdziłby naszych `CHECK`-ów |
+| `@JdbcTest` bez transakcji testowej | testujemy właśnie to, co commituje odbiorca; cofanie przez test by to zasłoniło |
+| Aplikacja nie wstaje bez bazy | dziennik to część giełdy; lepiej nie wystartować niż handlować bez zapisu |
+
+### Co znalazł code review (i co poprawiono)
+
+| Problem | Poprawka |
+|---|---|
+| `CHECK (... price > 0)` przepuszczał pustą cenę — `NULL > 0` to NULL, a `CHECK` z NULL przechodzi | jawne `price is not null` + test |
+| zawieszona baza w trakcie zapytania blokowałaby wątek silnika na zawsze | `socketTimeout: 5` w sterowniku |
+| `java.sql.Timestamp` przechodzi przez strefę czasową JVM | `OffsetDateTime` w UTC |
+| brak indeksu pod zapytanie „transakcje CDR z ostatniej godziny” | indeks `(symbol, occurred_at)` |
+| test integracyjny zakładał id = 1, a kontekst Springa jest współdzielony | id z odpowiedzi, dziennik od bieżącego miejsca |
+| Hikari: `connection-timeout: 2s` wywracał start | Hikari chce milisekund: `2000` (wyszło w testach) |
+
+Świadomie zostawione: **gdy baza leży, silnik zwalnia** (każde polecenie czeka do 2 s na
+połączenie), a zdarzenia z tego czasu są tylko logowane. Uczciwa naprawa to outbox (etap 5):
+silnik zapisuje zdarzenia lokalnie i od razu wraca, a osobny wątek wysyła je dalej.
+
+### Jak sprawdziliśmy, że testy coś łapią
+
+Sabotaż: zamiana transakcji na osobne `insert`-y → test „wszystko albo nic” pada.
+Testy mutacyjne (PIT) nie obejmują `persistence/` — każdy mutant stawiałby kontekst z bazą.
+
+### Pytania z rozmowy
+
+**Po co transakcja, skoro to tylko kilka insertów?**
+Zlecenie, które zjadło dwa poziomy i resztę położyło w arkuszu, to trzy zdarzenia.
+Gdyby zapisały się dwa, odtworzenie arkusza z dziennika (etap 8) dałoby inny stan niż prawdziwy.
+
+**Dlaczego `CHECK` w bazie, skoro Java i tak pilnuje typów?**
+Bo do bazy pisze nie tylko ta aplikacja: ręczny SQL, migracja, przyszły serwis. Baza to ostatnia
+linia obrony — a test `databaseRejectsRowsOfWrongShape` pokazał, że pierwsza wersja miała dziurę.
+
+**Czemu zapis w wątku silnika to problem?**
+Silnik czeka na bazę, więc przepustowość instrumentu ≈ 1 / czas zapisu (~1000 poleceń/s),
+a awaria bazy zatrzymuje handel. Rozwiązanie: transactional outbox i asynchroniczna publikacja.
+
+**Testcontainers vs H2 vs mocki?**
+Mock sprawdza, że wołasz `jdbc.update`, a nie że SQL działa. H2 udaje Postgresa, ale nie do końca.
+Testcontainers to prawdziwa baza w tej samej wersji co produkcja — kosztem kilku sekund i Dockera.
